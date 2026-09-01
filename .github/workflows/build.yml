@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       awg_ref:
-        description: "2Grey/awg-openwrt branch/tag/commit"
+        description: "2Grey/awg-openwrt branch, tag or commit"
         required: false
         default: "master"
 
@@ -25,18 +25,28 @@ env:
 
 jobs:
   build:
+    name: Build AWG packages
     runs-on: ubuntu-24.04
 
     permissions:
       contents: read
 
     steps:
-      - name: Checkout wrapper repository
+      # ------------------------------------------------------------
+      # 1. Checkout нашего wrapper-репозитория
+      # ------------------------------------------------------------
+      - name: Checkout repository
         uses: actions/checkout@v4
 
+      # ------------------------------------------------------------
+      # 2. Зависимости GitHub runner
+      # ------------------------------------------------------------
       - name: Install build dependencies
         run: |
+          set -eux
+
           sudo apt-get update
+
           sudo apt-get install -y \
             build-essential \
             clang \
@@ -61,33 +71,60 @@ jobs:
             curl \
             zstd
 
+      # ------------------------------------------------------------
+      # 3. Скачиваем именно официальный SDK ImmortalWrt 24.10.6
+      # ------------------------------------------------------------
       - name: Download official ImmortalWrt SDK
         run: |
           set -eux
 
-          wget -O "$SDK_FILE" \
+          wget \
+            --progress=dot:giga \
+            -O "$SDK_FILE" \
             "$SDK_BASE_URL/$SDK_FILE"
+
+          echo
+          echo "=== VERIFY SDK SHA256 ==="
 
           echo "$SDK_SHA256  $SDK_FILE" | sha256sum -c -
 
+      # ------------------------------------------------------------
+      # 4. Распаковка SDK
+      # ------------------------------------------------------------
       - name: Extract SDK
         run: |
           set -eux
 
           mkdir -p sdk
 
-          tar --zstd -xf "$SDK_FILE" \
+          tar \
+            --zstd \
+            -xf "$SDK_FILE" \
             --strip-components=1 \
             -C sdk
 
-          echo "SDK extracted:"
-          ls -la sdk | head -50
+          echo
+          echo "=== SDK ROOT ==="
 
+          ls -la sdk | head -100
+
+          echo
+          echo "=== SDK VERSION INFO ==="
+
+          if [ -f sdk/include/version.mk ]; then
+            grep -E \
+              'VERSION_NUMBER|VERSION_CODE|VERSION_REPO' \
+              sdk/include/version.mk || true
+          fi
+
+      # ------------------------------------------------------------
+      # 5. Берём актуальный upstream AWG
+      # ------------------------------------------------------------
       - name: Clone AWG upstream
         run: |
           set -eux
 
-          REF="${{ github.event.inputs.awg_ref }}"
+          REF="${{ inputs.awg_ref }}"
 
           if [ -z "$REF" ]; then
             REF="master"
@@ -97,25 +134,42 @@ jobs:
 
           cd awg-upstream
 
+          git fetch --all --tags
+
           git checkout "$REF"
+
+          echo
+          echo "=== AWG COMMIT ==="
 
           git rev-parse HEAD | tee ../awg-upstream-commit.txt
 
-      - name: Show upstream layout
+          echo
+          echo "=== AWG STATUS ==="
+
+          git status --short
+
+      # ------------------------------------------------------------
+      # 6. Проверяем структуру upstream
+      # ------------------------------------------------------------
+      - name: Inspect AWG source tree
         run: |
           set -eux
+
+          echo "=== UPSTREAM ROOT ==="
+
+          ls -la awg-upstream
+
+          echo
+          echo "=== PACKAGE MAKEFILES ==="
 
           find awg-upstream \
-            -maxdepth 3 \
+            -maxdepth 4 \
             -type f \
             -name Makefile \
-            -print
+            -print | sort
 
-      - name: Add AWG packages to SDK
-        run: |
-          set -eux
-
-          mkdir -p sdk/package/amneziawg
+          echo
+          echo "=== EXPECTED PACKAGES ==="
 
           for pkg in \
             kmod-amneziawg \
@@ -123,23 +177,46 @@ jobs:
             luci-proto-amneziawg
           do
             if [ ! -d "awg-upstream/$pkg" ]; then
-              echo "Missing upstream package: $pkg"
+              echo "ERROR: awg-upstream/$pkg not found"
               exit 1
             fi
 
-            cp -a \
-              "awg-upstream/$pkg" \
-              "sdk/package/amneziawg/$pkg"
+            echo "FOUND: $pkg"
           done
 
-          echo "Copied packages:"
+      # ------------------------------------------------------------
+      # 7. Подкладываем AWG packages в официальный SDK
+      # ------------------------------------------------------------
+      - name: Add AWG packages to SDK
+        run: |
+          set -eux
+
+          mkdir -p sdk/package/amneziawg
+
+          cp -a \
+            awg-upstream/kmod-amneziawg \
+            sdk/package/amneziawg/
+
+          cp -a \
+            awg-upstream/amneziawg-tools \
+            sdk/package/amneziawg/
+
+          cp -a \
+            awg-upstream/luci-proto-amneziawg \
+            sdk/package/amneziawg/
+
+          echo
+          echo "=== COPIED PACKAGES ==="
 
           find sdk/package/amneziawg \
-            -maxdepth 2 \
+            -maxdepth 3 \
             -type f \
             -name Makefile \
-            -print
+            -print | sort
 
+      # ------------------------------------------------------------
+      # 8. Feeds из SDK
+      # ------------------------------------------------------------
       - name: Update and install feeds
         working-directory: sdk
         run: |
@@ -148,150 +225,324 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: Select packages
+      # ------------------------------------------------------------
+      # 9. Включаем только нужные AWG packages
+      # ------------------------------------------------------------
+      - name: Select AWG packages
         working-directory: sdk
         run: |
           set -eux
 
-          cat >> .config <<'EOF'
-          CONFIG_PACKAGE_kmod-amneziawg=m
-          CONFIG_PACKAGE_amneziawg-tools=m
-          CONFIG_PACKAGE_luci-proto-amneziawg=m
-          EOF
+          {
+            echo "CONFIG_PACKAGE_kmod-amneziawg=m"
+            echo "CONFIG_PACKAGE_amneziawg-tools=m"
+            echo "CONFIG_PACKAGE_luci-proto-amneziawg=m"
+          } >> .config
 
           make defconfig
 
-          echo "Selected packages:"
+          echo
+          echo "=== SELECTED AWG CONFIG ==="
 
           grep -E \
-            'CONFIG_PACKAGE_(kmod-amneziawg|amneziawg-tools|luci-proto-amneziawg)' \
+            '^CONFIG_PACKAGE_(kmod-amneziawg|amneziawg-tools|luci-proto-amneziawg)=' \
             .config || true
 
+          echo
+          echo "=== TARGET CONFIG ==="
+
+          grep -E \
+            '^CONFIG_TARGET_(rockchip|rockchip_armv8)' \
+            .config || true
+
+      # ------------------------------------------------------------
+      # ВАЖНО:
+      # tools/install и toolchain/install здесь НЕ запускаем.
+      # Это SDK, toolchain в нём уже подготовлен.
+      # ------------------------------------------------------------
+
+      # ------------------------------------------------------------
+      # 10. Сборка kernel module
+      # ------------------------------------------------------------
       - name: Build kmod-amneziawg
         working-directory: sdk
         run: |
           set -eux
 
-          make package/amneziawg/kmod-amneziawg/compile \
+          make \
+            package/amneziawg/kmod-amneziawg/compile \
             -j"$(nproc)" \
             V=s
 
+      # ------------------------------------------------------------
+      # 11. Сборка userspace tools
+      # ------------------------------------------------------------
       - name: Build amneziawg-tools
         working-directory: sdk
         run: |
           set -eux
 
-          make package/amneziawg/amneziawg-tools/compile \
+          make \
+            package/amneziawg/amneziawg-tools/compile \
             -j"$(nproc)" \
             V=s
 
+      # ------------------------------------------------------------
+      # 12. Сборка LuCI protocol
+      # ------------------------------------------------------------
       - name: Build luci-proto-amneziawg
         working-directory: sdk
         run: |
           set -eux
 
-          make package/amneziawg/luci-proto-amneziawg/compile \
+          make \
+            package/amneziawg/luci-proto-amneziawg/compile \
             -j"$(nproc)" \
             V=s
 
-      - name: Locate produced packages
+      # ------------------------------------------------------------
+      # 13. Собираем результаты в artifacts/
+      # ------------------------------------------------------------
+      - name: Collect produced packages
         run: |
           set -eux
 
+          rm -rf artifacts
           mkdir -p artifacts
+
+          echo "=== ALL AWG PACKAGES IN SDK ==="
 
           find sdk/bin \
             -type f \
             \( \
-              -name '*amneziawg*.ipk' \
-              -o -name '*amneziawg*.apk' \
+              -name 'kmod-amneziawg*.ipk' \
+              -o -name 'amneziawg-tools*.ipk' \
+              -o -name 'luci-proto-amneziawg*.ipk' \
+              -o -name 'kmod-amneziawg*.apk' \
+              -o -name 'amneziawg-tools*.apk' \
+              -o -name 'luci-proto-amneziawg*.apk' \
             \) \
-            -print \
+            -print
+
+          echo
+          echo "=== COPY ==="
+
+          find sdk/bin \
+            -type f \
+            \( \
+              -name 'kmod-amneziawg*.ipk' \
+              -o -name 'amneziawg-tools*.ipk' \
+              -o -name 'luci-proto-amneziawg*.ipk' \
+              -o -name 'kmod-amneziawg*.apk' \
+              -o -name 'amneziawg-tools*.apk' \
+              -o -name 'luci-proto-amneziawg*.apk' \
+            \) \
             -exec cp -v {} artifacts/ \;
 
           echo
-          echo "Artifacts:"
+          echo "=== ARTIFACT DIRECTORY ==="
+
           ls -lh artifacts
 
-          test -n "$(find artifacts -type f | head -1)"
-
-      - name: Inspect package metadata
+      # ------------------------------------------------------------
+      # 14. Проверяем, что ВСЕ 3 пакета реально получены
+      # ------------------------------------------------------------
+      - name: Verify required packages
         run: |
           set -eux
 
-          mkdir -p metadata
+          echo "=== VERIFY KMOD ==="
 
-          for pkg in artifacts/*.ipk
-          do
-            [ -f "$pkg" ] || continue
+          KMOD="$(
+            find artifacts \
+              -maxdepth 1 \
+              -type f \
+              \( \
+                -name 'kmod-amneziawg*.ipk' \
+                -o -name 'kmod-amneziawg*.apk' \
+              \) \
+              | head -1
+          )"
 
-            NAME="$(basename "$pkg")"
-
-            echo "========================================"
-            echo "$NAME"
-            echo "========================================"
-
-            mkdir -p "metadata/$NAME"
-
-            cd "metadata/$NAME"
-
-            ar x "../../$pkg"
-
-            CONTROL="$(find . \
-              \( -name 'control.tar.gz' \
-                 -o -name 'control.tar.zst' \
-                 -o -name 'control.tar.xz' \) \
-              | head -1)"
-
-            if [ -n "$CONTROL" ]; then
-              tar -xf "$CONTROL"
-            fi
-
-            if [ -f control ]; then
-              cat control
-            fi
-
-            cd ../..
-          done
-
-      - name: Verify kernel ABI dependency
-        run: |
-          set -eux
-
-          CONTROL="$(find metadata \
-            -path '*kmod-amneziawg*' \
-            -name control \
-            | head -1)"
-
-          if [ -z "$CONTROL" ]; then
-            echo "kmod-amneziawg control file not found"
+          if [ -z "$KMOD" ]; then
+            echo "ERROR: kmod-amneziawg was not produced"
             exit 1
           fi
 
-          echo "kmod-amneziawg metadata:"
-          cat "$CONTROL"
+          echo "KMOD=$KMOD"
 
           echo
-          echo "Kernel dependency:"
+          echo "=== VERIFY TOOLS ==="
 
-          grep '^Depends:' "$CONTROL" || true
+          TOOLS="$(
+            find artifacts \
+              -maxdepth 1 \
+              -type f \
+              \( \
+                -name 'amneziawg-tools*.ipk' \
+                -o -name 'amneziawg-tools*.apk' \
+              \) \
+              | head -1
+          )"
 
-      - name: Save build information
+          if [ -z "$TOOLS" ]; then
+            echo "ERROR: amneziawg-tools was not produced"
+            exit 1
+          fi
+
+          echo "TOOLS=$TOOLS"
+
+          echo
+          echo "=== VERIFY LUCI ==="
+
+          LUCI="$(
+            find artifacts \
+              -maxdepth 1 \
+              -type f \
+              \( \
+                -name 'luci-proto-amneziawg*.ipk' \
+                -o -name 'luci-proto-amneziawg*.apk' \
+              \) \
+              | head -1
+          )"
+
+          if [ -z "$LUCI" ]; then
+            echo "ERROR: luci-proto-amneziawg was not produced"
+            exit 1
+          fi
+
+          echo "LUCI=$LUCI"
+
+      # ------------------------------------------------------------
+      # 15. Только диагностируем формат package-файлов.
+      # Ничего через ar не распаковываем.
+      # ------------------------------------------------------------
+      - name: Inspect package files
+        run: |
+          set -eux
+
+          echo "=== FILE TYPES ==="
+
+          for pkg in artifacts/*
+          do
+            echo
+            echo "----------------------------------------"
+            echo "$pkg"
+            echo "----------------------------------------"
+
+            file "$pkg"
+
+            sha256sum "$pkg"
+          done
+
+      # ------------------------------------------------------------
+      # 16. Ищем собранный .ko отдельно.
+      # Это важная дополнительная проверка kernel-module.
+      # ------------------------------------------------------------
+      - name: Locate compiled kernel module
+        run: |
+          set -eux
+
+          echo "=== AMNEZIAWG KO FILES ==="
+
+          find sdk \
+            -type f \
+            \( \
+              -name 'amneziawg.ko' \
+              -o -name '*amneziawg*.ko' \
+            \) \
+            -print || true
+
+          KO="$(
+            find sdk \
+              -type f \
+              \( \
+                -name 'amneziawg.ko' \
+                -o -name '*amneziawg*.ko' \
+              \) \
+              | head -1
+          )"
+
+          if [ -n "$KO" ]; then
+            echo
+            echo "=== MODULE FILE ==="
+            file "$KO"
+
+            echo
+            echo "=== MODULE SIZE ==="
+            ls -lh "$KO"
+
+            cp -v "$KO" artifacts/ || true
+          else
+            echo
+            echo "WARNING: separate .ko file not found."
+            echo "The kmod package itself was produced, so this is not fatal."
+          fi
+
+      # ------------------------------------------------------------
+      # 17. Сохраняем точную информацию о сборке
+      # ------------------------------------------------------------
+      - name: Create build information
         run: |
           set -eux
 
           {
-            echo "ImmortalWrt version: $IMMORTAL_VERSION"
+            echo "AmneziaWG build for ImmortalWrt"
+            echo
+            echo "ImmortalWrt release: $IMMORTAL_VERSION"
             echo "Target: $TARGET/$SUBTARGET"
-            echo "SDK: $SDK_FILE"
-            echo "SDK SHA256: $SDK_SHA256"
-            echo -n "AWG upstream commit: "
+            echo
+            echo "SDK:"
+            echo "$SDK_FILE"
+            echo
+            echo "SDK SHA256:"
+            echo "$SDK_SHA256"
+            echo
+            echo "AWG upstream repository:"
+            echo "$AWG_REPO"
+            echo
+            echo "AWG upstream commit:"
             cat awg-upstream-commit.txt
+            echo
+            echo "Build date UTC:"
+            date -u
           } > artifacts/BUILD-INFO.txt
+
+          echo
+          echo "=== BUILD INFO ==="
 
           cat artifacts/BUILD-INFO.txt
 
-      - name: Upload packages
+      # ------------------------------------------------------------
+      # 18. Финальный список
+      # ------------------------------------------------------------
+      - name: Final artifact list
+        run: |
+          set -eux
+
+          echo "=========================================="
+          echo "        BUILD COMPLETED SUCCESSFULLY"
+          echo "=========================================="
+          echo
+
+          ls -lah artifacts
+
+          echo
+          echo "=== SHA256 ==="
+
+          find artifacts \
+            -maxdepth 1 \
+            -type f \
+            ! -name 'SHA256SUMS' \
+            -exec sha256sum {} \; \
+            > artifacts/SHA256SUMS
+
+          cat artifacts/SHA256SUMS
+
+      # ------------------------------------------------------------
+      # 19. Публикуем результат в GitHub Actions
+      # ------------------------------------------------------------
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: amneziawg-immortalwrt-24.10.6-rockchip-armv8
