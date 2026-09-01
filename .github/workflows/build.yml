@@ -167,14 +167,6 @@ jobs:
             'CONFIG_PACKAGE_(kmod-amneziawg|amneziawg-tools|luci-proto-amneziawg)' \
             .config || true
 
-      - name: Prepare package toolchain
-        working-directory: sdk
-        run: |
-          set -eux
-
-          make tools/install -j"$(nproc)" V=s
-          make toolchain/install -j"$(nproc)" V=s
-
       - name: Build kmod-amneziawg
         working-directory: sdk
         run: |
