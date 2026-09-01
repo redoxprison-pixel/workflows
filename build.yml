@@ -1,0 +1,294 @@
+name: Build AmneziaWG for ImmortalWrt R3S
+
+on:
+  workflow_dispatch:
+    inputs:
+      awg_ref:
+        description: "2Grey/awg-openwrt branch/tag/commit"
+        required: false
+        default: "master"
+
+  push:
+    paths:
+      - ".github/workflows/build.yml"
+
+env:
+  IMMORTAL_VERSION: "24.10.6"
+  TARGET: "rockchip"
+  SUBTARGET: "armv8"
+
+  SDK_FILE: "immortalwrt-sdk-24.10.6-rockchip-armv8_gcc-13.3.0_musl.Linux-x86_64.tar.zst"
+  SDK_SHA256: "f467c5053592de610bb8b4d3a0ee9b1e883be84b6c2864aa5ee571b4fdccbe03"
+
+  SDK_BASE_URL: "https://downloads.immortalwrt.org/releases/24.10.6/targets/rockchip/armv8"
+
+  AWG_REPO: "https://github.com/2Grey/awg-openwrt.git"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout wrapper repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            flex \
+            bison \
+            g++ \
+            gawk \
+            gcc-multilib \
+            gettext \
+            git \
+            libncurses-dev \
+            libssl-dev \
+            python3 \
+            python3-distutils-extra \
+            rsync \
+            unzip \
+            file \
+            wget \
+            curl \
+            zstd
+
+      - name: Download official ImmortalWrt SDK
+        run: |
+          set -eux
+
+          wget -O "$SDK_FILE" \
+            "$SDK_BASE_URL/$SDK_FILE"
+
+          echo "$SDK_SHA256  $SDK_FILE" | sha256sum -c -
+
+      - name: Extract SDK
+        run: |
+          set -eux
+
+          mkdir sdk
+          tar --zstd -xf "$SDK_FILE" \
+            --strip-components=1 \
+            -C sdk
+
+          echo "SDK extracted:"
+          ls -la sdk | head -50
+
+      - name: Clone AWG upstream
+        run: |
+          set -eux
+
+          REF="${{ github.event.inputs.awg_ref }}"
+          [ -n "$REF" ] || REF="master"
+
+          git clone \
+            --depth 1 \
+            --branch "$REF" \
+            "$AWG_REPO" \
+            awg-upstream || {
+              git clone "$AWG_REPO" awg-upstream
+              cd awg-upstream
+              git checkout "$REF"
+            }
+
+          git -C awg-upstream rev-parse HEAD | tee awg-upstream-commit.txt
+
+      - name: Show upstream layout
+        run: |
+          set -eux
+
+          find awg-upstream \
+            -maxdepth 2 \
+            -type f \
+            -name Makefile \
+            -print
+
+      - name: Add AWG packages to SDK
+        run: |
+          set -eux
+
+          mkdir -p sdk/package/amneziawg
+
+          for pkg in \
+            kmod-amneziawg \
+            amneziawg-tools \
+            luci-proto-amneziawg
+          do
+            if [ ! -d "awg-upstream/$pkg" ]; then
+              echo "Missing upstream package: $pkg"
+              exit 1
+            fi
+
+            cp -a \
+              "awg-upstream/$pkg" \
+              "sdk/package/amneziawg/$pkg"
+          done
+
+          echo "Copied packages:"
+          find sdk/package/amneziawg -maxdepth 2 -type f -name Makefile -print
+
+      - name: Update and install feeds
+        working-directory: sdk
+        run: |
+          set -eux
+
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Select packages
+        working-directory: sdk
+        run: |
+          set -eux
+
+          cat >> .config <<'EOF'
+          CONFIG_PACKAGE_kmod-amneziawg=m
+          CONFIG_PACKAGE_amneziawg-tools=m
+          CONFIG_PACKAGE_luci-proto-amneziawg=m
+          EOF
+
+          make defconfig
+
+          grep -E \
+            'CONFIG_PACKAGE_(kmod-amneziawg|amneziawg-tools|luci-proto-amneziawg)' \
+            .config || true
+
+      - name: Prepare package toolchain
+        working-directory: sdk
+        run: |
+          set -eux
+
+          make tools/install -j"$(nproc)" V=s
+          make toolchain/install -j"$(nproc)" V=s
+
+      - name: Build AmneziaWG
+        working-directory: sdk
+        run: |
+          set -eux
+
+          make package/amneziawg/kmod-amneziawg/compile \
+            -j"$(nproc)" \
+            V=s
+
+          make package/amneziawg/amneziawg-tools/compile \
+            -j"$(nproc)" \
+            V=s
+
+          make package/amneziawg/luci-proto-amneziawg/compile \
+            -j"$(nproc)" \
+            V=s
+
+      - name: Locate produced packages
+        run: |
+          set -eux
+
+          mkdir -p artifacts
+
+          find sdk/bin \
+            -type f \
+            \( \
+              -name '*amneziawg*.ipk' \
+              -o -name '*amneziawg*.apk' \
+            \) \
+            -print \
+            -exec cp -v {} artifacts/ \;
+
+          echo
+          echo "Artifacts:"
+          ls -lh artifacts
+
+          test -n "$(find artifacts -type f | head -1)"
+
+      - name: Inspect package metadata
+        run: |
+          set -eux
+
+          mkdir -p metadata
+
+          for pkg in artifacts/*.ipk; do
+            [ -f "$pkg" ] || continue
+
+            NAME="$(basename "$pkg")"
+
+            echo "========================================"
+            echo "$NAME"
+            echo "========================================"
+
+            ar t "$pkg"
+
+            mkdir -p "metadata/$NAME"
+
+            cd "metadata/$NAME"
+
+            ar x "../../$pkg"
+
+            CONTROL="$(find . -name 'control.tar.*' -o -name 'control.tar.gz' | head -1)"
+
+            if [ -n "$CONTROL" ]; then
+              tar -xf "$CONTROL"
+            fi
+
+            if [ -f control ]; then
+              cat control
+            fi
+
+            cd ../..
+          done
+
+      - name: Verify kernel ABI dependency
+        run: |
+          set -eux
+
+          echo "Searching kmod metadata..."
+
+          CONTROL="$(find metadata \
+            -path '*kmod-amneziawg*' \
+            -name control \
+            | head -1)"
+
+          if [ -z "$CONTROL" ]; then
+            echo "kmod-amneziawg control file not found"
+            exit 1
+          fi
+
+          echo
+          cat "$CONTROL"
+          echo
+
+          KERNEL_DEP="$(grep '^Depends:' "$CONTROL" | grep -o 'kernel ([^)]*)' || true)"
+
+          if [ -z "$KERNEL_DEP" ]; then
+            echo "Kernel dependency not detected"
+            exit 1
+          fi
+
+          echo "Detected dependency:"
+          echo "$KERNEL_DEP"
+
+      - name: Save build information
+        run: |
+          set -eux
+
+          {
+            echo "ImmortalWrt version: $IMMORTAL_VERSION"
+            echo "Target: $TARGET/$SUBTARGET"
+            echo "SDK: $SDK_FILE"
+            echo "SDK SHA256: $SDK_SHA256"
+            echo -n "AWG upstream commit: "
+            cat awg-upstream-commit.txt
+          } > artifacts/BUILD-INFO.txt
+
+          cat artifacts/BUILD-INFO.txt
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: amneziawg-immortalwrt-24.10.6-rockchip-armv8
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 30
